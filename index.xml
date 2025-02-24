@@ -2,17 +2,17 @@
 <rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
   <channel>
     <title>crim&#39;s Blog</title>
-    <link>http://localhost:1313/</link>
+    <link>https://crimsonskylark.github.io/</link>
     <description>Recent content on crim&#39;s Blog</description>
     <generator>Hugo</generator>
     <language>en-us</language>
     <lastBuildDate>Mon, 24 Feb 2025 12:03:53 -0300</lastBuildDate>
-    <atom:link href="http://localhost:1313/index.xml" rel="self" type="application/rss+xml" />
+    <atom:link href="https://crimsonskylark.github.io/index.xml" rel="self" type="application/rss+xml" />
     <item>
       <title>Notes on exception handling and dispatching at the kernel level on the Windows 10 x64</title>
-      <link>http://localhost:1313/posts/exception-handling-pt1/</link>
+      <link>https://crimsonskylark.github.io/posts/exception-handling-pt1/</link>
       <pubDate>Mon, 24 Feb 2025 12:03:53 -0300</pubDate>
-      <guid>http://localhost:1313/posts/exception-handling-pt1/</guid>
+      <guid>https://crimsonskylark.github.io/posts/exception-handling-pt1/</guid>
       <description>&lt;h2 id=&#34;disclaimer&#34;&gt;Disclaimer&lt;/h2&gt;&#xA;&lt;p&gt;This work is, by and large, the product of reverse engineering. Whilst I did consult some source code (referenced at the bottom) to retrieve certain definitions, the bulk of the research was done with a disassembler, therefore some information may be incomplete, misunderstood or outright incorrect. If you spot anything wrong please reach out to me and I&amp;rsquo;ll be glad to issue a correction.&lt;/p&gt;&#xA;&lt;h2 id=&#34;preface&#34;&gt;Preface&lt;/h2&gt;&#xA;&lt;p&gt;In this article I aim to explain some parts of how exception handling works at the kernel level on Windows 10. The article is divided into sections, each addressing a specific function in the process along with some finer details provided where deemed necessary. Additionally, there&amp;rsquo;s a section with background information and a glossary of technical terms. If this is your first reading, I recommend starting with the glossary to get an overview of the concepts we&amp;rsquo;ll explore. If you&amp;rsquo;re already familiar with most of the terms and concepts, feel free to start from the beginning.&lt;/p&gt;</description>
     </item>
   </channel>
