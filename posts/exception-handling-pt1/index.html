@@ -98,7 +98,7 @@
 </ol>
 </li>
 </ol>
-<p>The contents of <code>_MACHINE_FRAME</code> are copied onto the newly retrieved stack, the saved registers are restored and we <code>jmp</code>—<strong>not</strong> <code>call</code>, the distinction matters because the stack layout remains the same—into <code>KxDebugTrapOrFault</code>.</p>
+<p>The contents of <code>_MACHINE_FRAME</code> are copied onto the newly retrieved stack, the saved registers are restored and we <code>jmp</code> (<strong>not</strong> <code>call</code>, the distinction matters because the stack layout remains the same) into <code>KxDebugTrapOrFault</code>.</p>
 <h3 id="kxdebugtraporfault"><code>KxDebugTrapOrFault</code></h3>
 <p>The primary responsibility of this function is building the <code>_KTRAP_FRAME</code> on the stack, one of three kernel frames (referred to as Kframes) used during exception dispatching. Since this frame is built directly on the stack, careful attention must be paid to the memory layout.</p>
 <p>Starting off, let&rsquo;s visualize how the stack looks immediately after we jumped here:</p>
@@ -112,7 +112,7 @@
 <p>Since much of the upcoming code focuses on manipulating the trap frame let&rsquo;s take a brief detour to examine how it is constructed.</p>
 <h5 id="building-the-trap-frame">Building the trap frame</h5>
 <p>After executing the first two instructions in Figure 2, this is what the stack looks like:</p>
-<p><img src="/eh-pt1/eh-pt1/Diagrams-Stage2.png" alt="Figure 3"></p>
+<p><img src="/eh-pt1/Diagrams-Stage2.png" alt="Figure 3"></p>
 <p><em>Figure 3: Machine frame, dummy error code and RBP pushed onto the stack, essentially forming the lower 56 bytes of <code>_KTRAP_FRAME</code></em></p>
 <p>Referring back to Figure 2, we allocated 344 (0x158) bytes on the stack. This size is significant because it corresponds to the default size of <code>_KTRAP_FRAME</code> on x64 (0x190) minus the 56 bytes (0x38) of information already collected (shown as color-coded entries in the diagram): 0x190 - 0x38 = 0x158.</p>
 <p>After this allocation during the prologue, the stack now looks as follows:
@@ -357,7 +357,7 @@
 </span></span><span style="display:flex;"><span>.PUSHREG R12
 </span></span><span style="display:flex;"><span>.PUSHREG RBP
 </span></span></code></pre></div><p><img src="/eh-pt1/Diagrams-UnwindOperations.png" alt="Figure 19"></p>
-<p><em>Figure 18: Relationship between unwind codes and prologue instructions at the top. Example mapping between an unwind code and the C union at the bottom.</em></p>
+<p><em>Figure 19: Relationship between unwind codes and prologue instructions at the top. Example mapping between an unwind code and the C union at the bottom.</em></p>
 <p>To undo the changes made during the function&rsquo;s prologue we need to reverse the adjustments to the stack pointer (RSP) and restore the original state, which was <code>0x83C84FFC00</code>. Since we are assuming the exception occurred in the middle of the function, <code>_CONTEXT.Rsp</code> will hold the value after the prologue (<code>0x83C84FF408</code>).</p>
 <p>Interpreting the unwind codes step-by-step:</p>
 <ol>
@@ -440,7 +440,7 @@
 </ul>
 <p>The purpose of the dispatcher context is to store state across consecutive unwinds such as the unwind history table and the index of the most recently processed scope in the table, reducing potentially redundant work over recurring unwinds.</p>
 <p>With everything set up, <code>RtlpExecuteHandlerForException</code> is invoked with the exception record (<code>rcx</code>), the establisher frame (<code>rdx</code>), cloned <code>_CONTEXT</code> (<code>r8</code>) and dispatcher context (<code>r9</code>). This function is a short wrapper around an indirect call to the language handler, but since it has its own exception handler it serves an important purpose which is to report nested exceptions, cases when an exception happens while handling another.</p>
-<p>The return type of the handler function is <code>EXCEPTION_DISPOSITION</code>, which indicates the state of the exception after the handler finishes execution. This is determines the behavior of <code>RtlDispatchException</code> once the handler returns as we will soon see.</p>
+<p>The return type of the handler function is <code>EXCEPTION_DISPOSITION</code>, which indicates the state of the exception after the handler finishes execution. This determines the behavior of <code>RtlDispatchException</code> once the handler returns as we will soon see.</p>
 <p>The values we are concerned with are:</p>
 <ul>
 <li><code>ExceptionContinueExecution</code>: The exception is considered handled, and no further handlers will be invoked. Execution resumes at the faulting instruction pointer. This option is only valid for some exception types such as in our case of <code>STATUS_SINGLE_STEP</code>/INT1.</li>
@@ -507,7 +507,7 @@
 </span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT SegSs;                                                           <span style="color:#75715e">//0x20
 </span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT Fill3[<span style="color:#ae81ff">3</span>];                                                        <span style="color:#75715e">//0x22
 </span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>};
-</span></span></code></pre></div><p>It comprises the most basic information required by in order to resume execution after interrupt handling completes. These values are automatically pushed onto the stack by the CPU when an interrupt occurs. The layout is consistent due to being enforced by the architecture. This is how the manual defines it<sup id="fnref:13"><a href="#fn:13" class="footnote-ref" role="doc-noteref">13</a></sup><sup id="fnref:14"><a href="#fn:14" class="footnote-ref" role="doc-noteref">14</a></sup>:</p>
+</span></span></code></pre></div><p>It comprises the most basic information required by the OS in order to resume execution after interrupt handling completes. These values are automatically pushed onto the stack by the CPU when an interrupt occurs. The layout is consistent due to being enforced by the architecture. This is how the manual defines it<sup id="fnref:13"><a href="#fn:13" class="footnote-ref" role="doc-noteref">13</a></sup><sup id="fnref:14"><a href="#fn:14" class="footnote-ref" role="doc-noteref">14</a></sup>:</p>
 <p><img src="/eh-pt1/20241025075139.png" alt="_MACHINE_FRAME"></p>
 <p>As can be seen in this figure, there are two possible layouts for the function: One including an error code, and the other with no error code. Windows only ever utilizes the former, and manually reserves stack space to account for the missing error code when required.</p>
 <h4 id="task-state-segment">Task State Segment</h4>
@@ -527,11 +527,11 @@
 </span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT IoMapBase;                                                       <span style="color:#75715e">//0x66
 </span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>};
 </span></span></code></pre></div><h4 id="interrupt-stack-table">Interrupt Stack Table</h4>
-<p>The IST part of the 64-bit extension to the x86 TSS and its job is to provide a known-good stack for certain interrupts/exceptions. Whether this feature is utilized at all by an exception (and which of the 7 entries is picked) is configured by the operating system by setting specific fields in the interrupt (or exception) gate.</p>
+<p>The IST is part of the 64-bit extension to the x86 TSS and its job is to provide a known-good stack for certain interrupts/exceptions. Whether this feature is utilized at all by an exception (and which of the 7 entries is picked) is configured by the operating system by setting specific fields in the interrupt (or exception) gate.</p>
 <p>For our purposes, it is sufficient to know this mechanism exists and, when enabled, is unconditionally utilized by the CPU.</p>
 <h4 id="interrupt-descriptor-table">Interrupt Descriptor Table</h4>
 <p>The CPU needs a way to know which OS functions to call when an interrupt or exception occurs. On x64, this information is stored in the interrupt descriptor table (IDT) which is set up by the OS during the early boot process.</p>
-<p>The IDT, a pointer to which is stored in upper 8 bytes of the register <code>IDTR</code>, contains gates for all the possible 256 interrupt and exception vectors with the first 32 entries reserved for the CPU. Of the total 256 entries, some are used for exceptions, others for software interrupts and the rest for hardware interrupts. Note that not all entries might be in use in a given system. Below you can find the entirely-not-convoluted layout for an IDT gate.</p>
+<p>The IDT, a pointer to which is stored in upper 8 bytes of the register <code>IDTR</code>, contains gates for all the possible 256 interrupt and exception vectors with the first 32 entries reserved for the CPU. Of the total 256 entries, some are used for exceptions, others for software interrupts and the rest for hardware interrupts. Note that some entries may remain unused in a particular system. Below you can find the entirely-not-convoluted layout for an IDT gate.</p>
 <p><img src="/eh-pt1/20241112083820.png" alt="IDT64"></p>
 <h4 id="frame-unwinding">Frame unwinding</h4>
 <p>Unwinding is the process of restoring the stack pointer (RSP) of a function back to its value on entry by restoring its original value and recovering the non-volatile register state when an exception occurs.</p>
