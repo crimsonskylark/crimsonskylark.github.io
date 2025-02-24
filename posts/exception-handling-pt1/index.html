@@ -1,0 +1,672 @@
+<!DOCTYPE html>
+<html lang="en">
+
+    <head><script src="/livereload.js?mindelay=10&amp;v=2&amp;port=1313&amp;path=livereload" data-no-instant defer></script><title>Notes on exception handling and dispatching at the kernel level on the Windows 10 x64 &ndash; crim&#39;s Blog</title>
+
+
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta charset="UTF-8"/>
+
+
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.6.0/css/all.min.css" integrity="sha512-Kc323vGBEqzTmouAECnVceyQqyqdsSiqLQISBL29aUW4U/M7pSPA/gEUZQqv1cwx4OnYxTxve5UMg5GT6L4JJg==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+
+
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/academicons/1.9.4/css/academicons.min.css" integrity="sha512-IW0nhlW5MgNydsXJO40En2EoCkTTjZhI3yuODrZIc8cQ4h1XcF53PsqDHa09NqnkXuIe0Oiyyj171BqZFwISBw==" crossorigin="anonymous" referrerpolicy="no-referrer" />
+
+
+<link rel="stylesheet" href="http://localhost:1313/css/palettes/base16-dark.css">
+<link rel="stylesheet" href="http://localhost:1313/css/risotto.css">
+<link rel="stylesheet" href="http://localhost:1313/css/custom.css">
+
+
+
+
+
+
+
+
+
+
+</head>
+
+    <body>
+        <div class="page">
+
+            <header class="page__header"><nav class="page__nav main-nav">
+    <ul>
+      <li class="nomarker"><h1 class="page__logo"><a href="http://localhost:1313/" class="page__logo-inner">crim&#39;s Blog</a></h1></li>
+    
+    
+    <li class="main-nav__item"><a class="nav-main-item active" href="http://localhost:1313/posts/" title="Posts">Posts</a></li>
+    
+    </ul>
+</nav>
+
+</header>
+
+            <section class="page__body">
+    <header class="content__header">
+        <h1>Notes on exception handling and dispatching at the kernel level on the Windows 10 x64</h1>
+    </header>
+    <div class="content__body">
+        <h2 id="disclaimer">Disclaimer</h2>
+<p>This work is, by and large, the product of reverse engineering. Whilst I did consult some source code (referenced at the bottom) to retrieve certain definitions, the bulk of the research was done with a disassembler, therefore some information may be incomplete, misunderstood or outright incorrect. If you spot anything wrong please reach out to me and I&rsquo;ll be glad to issue a correction.</p>
+<h2 id="preface">Preface</h2>
+<p>In this article I aim to explain some parts of how exception handling works at the kernel level on Windows 10. The article is divided into sections, each addressing a specific function in the process along with some finer details provided where deemed necessary. Additionally, there&rsquo;s a section with background information and a glossary of technical terms. If this is your first reading, I recommend starting with the glossary to get an overview of the concepts we&rsquo;ll explore. If you&rsquo;re already familiar with most of the terms and concepts, feel free to start from the beginning.</p>
+<p>The discussion uses the INT1 (Debug exception) as an entry point, though it is worth noting that beyond a certain stage distinctions between this and other vectors often become muddy.</p>
+<h4 id="scope">Scope</h4>
+<p>To streamline the explanation, this article assumes the CPU was already operating in kernel mode at the time of the exception. This simplification helps focus on the mechanics of exception dispatching and handling by excluding discussions of user-mode transitions, SMAP/SMEP, speculative and out-of-order execution (OoO) mitigations. Similarly, paths leading to userland (CPL 3) returns are omitted although I plan to write about it at some point. Architecture-specific details such as (L)APIC functionality are also excluded, as they fall outside the Windows-specific scope of this article.</p>
+<p>When discussing unwind data, the focus is exclusively on SEH (Structured Exception Handling) the default exception model available in the Windows kernel.</p>
+<h4 id="assumptions">Assumptions</h4>
+<p>When I present the sample case used to understand the stack unwinding process the implicit assumption is dealing with the case where a function has a registered <em>exception</em> (not unwind) handler and no collided unwinds are possible. The deeper mechanics of stack unwinding have already been explored by previous research on the subject. Again, links to all consulted works are at the end.</p>
+<p>All tests have been performed on an AMD Zen3 CPU and Windows 10 22H2 19045.4894.</p>
+<hr>
+<p>Let&rsquo;s start with an overview of what we will be working through. Since we are dealing with INT1, we have the following flow:</p>
+<p><img src="/eh-pt1/eh-pt1/Diagrams-Stage0.png" alt="Figure 0"></p>
+<p><em>Figure 0: An overview of the execution flow starting at the IDT</em></p>
+<hr>
+<h3 id="cpu-exception-pre-processing">CPU exception pre-processing</h3>
+<p>When an exception occurs the CPU uses the interrupt vector to index into the Interrupt Descriptor Table (IDT) and calls the associated handler to transfer control to the operating system. However, before this happens, the CPU performs several internal tasks. I refer to these as &ldquo;pre-processing tasks,&rdquo; although this term isn&rsquo;t found in the official manual or other documentation I&rsquo;ve encountered. Still, understanding these steps is helpful for making sense of certain checks, behaviors and assumptions later in the process.</p>
+<p>In order of occurrence:</p>
+<ol>
+<li>Align RSP to a 16 byte boundary</li>
+<li>Read a stack pointer from the IST, if the gate (field <code>IST</code> in the descriptor) specifies it</li>
+<li>If a privilege change occurs retrieve <code>TSS.Rsp0</code> and load into RSP</li>
+<li>If a privilege change occurs, before the machine frame is pushed, clear the stack segment selector (SS) to zero</li>
+<li>Push return SS</li>
+<li>Push return RSP</li>
+<li>Push return RFLAGS</li>
+<li>Clear trap flag (TF), nested-task (NT) and resume flag (RF) in RFLAGS</li>
+<li>If the descriptor is for an interrupt (field <code>Type</code> in the gate descriptor) then clear the interrupt flag (IF), otherwise leave it unchanged</li>
+<li>Push the return CS</li>
+<li>Push the return RIP</li>
+<li>Push the error code (if any)</li>
+<li>Load CS with the selector (field <code>Target Selector</code> in the gate descriptor) retrieved from the IDT entry</li>
+<li>Load RIP with the routine address (concatenation of the <code>Target Offset</code> fields in the gate descriptor), also retrieved from the IDT entry</li>
+</ol>
+<h3 id="kidebugtraporfault"><code>KiDebugTrapOrFault</code></h3>
+<p>This is the initial function invoked to handle the exception after the CPU completes its pre-processing. It operates on a dedicated stack allocated by the Interrupt Stack Table (IST) and is quite short. Its primary role is to set up the foundation for the <code>_KTRAP_FRAME</code><sup id="fnref:1"><a href="#fn:1" class="footnote-ref" role="doc-noteref">1</a></sup>, which will be constructed in <code>KxDebugTrapOrFault</code>. More on that later.</p>
+<p>After saving the current state of some registers utilized throughout the function we can find two execution paths:</p>
+<ol>
+<li>Checks if the CPU was already in CPL 0<sup id="fnref:2"><a href="#fn:2" class="footnote-ref" role="doc-noteref">2</a></sup> when interrupted, the function interrupted is one of the trap routines<sup id="fnref:3"><a href="#fn:3" class="footnote-ref" role="doc-noteref">3</a></sup> and if tracing functionality is enabled. If all checks pass there is an early return. This execution path is uninteresting for our purposes.</li>
+<li>If the CPU was in CPL 0 or it was in CPL 3 a new stack is retrieved from one of three possible places and loaded into RSP:
+<ol>
+<li>If in CPL 0, read the previous stack pointer from the <code>_MACHINE_FRAME</code>. Remember we were automatically given a private stack from the IST on entry, so the RSP saved on the machine frame might be different;</li>
+<li>If in CPL 3, check whether KVA shadowing<sup id="fnref:4"><a href="#fn:4" class="footnote-ref" role="doc-noteref">4</a></sup> is enabled and retrieve a shadow stack pointer from the PRCB if so;</li>
+<li>Otherwise, retrieve it from <code>KPCR-&gt;Prcb.RspBase</code>—which is actually the same value as <code>KTSS64.Rsp0</code>.</li>
+</ol>
+</li>
+</ol>
+<p>The contents of <code>_MACHINE_FRAME</code> are copied onto the newly retrieved stack, the saved registers are restored and we <code>jmp</code>—<strong>not</strong> <code>call</code>, the distinction matters because the stack layout remains the same—into <code>KxDebugTrapOrFault</code>.</p>
+<h3 id="kxdebugtraporfault"><code>KxDebugTrapOrFault</code></h3>
+<p>The primary responsibility of this function is building the <code>_KTRAP_FRAME</code> on the stack, one of three kernel frames (referred to as Kframes) used during exception dispatching. Since this frame is built directly on the stack, careful attention must be paid to the memory layout.</p>
+<p>Starting off, let&rsquo;s visualize how the stack looks immediately after we jumped here:</p>
+<p><img src="/eh-pt1/KxDebugTrapOrFault_Stage1.png" alt="Figure 1"></p>
+<p><em>Figure 1: In-memory layout of the stack after jumping into <code>KxDebugTrapOrFault</code></em></p>
+<p>Here&rsquo;s what the first basic block of this function contains:</p>
+<p><img src="/eh-pt1/20241104112156.png" alt="Figure 2"></p>
+<p><em>Figure 2: The first block of <code>KxDebugTrapOrFault</code> - responsible for saving some of the registers and allocating the trap frame</em></p>
+<p>The function begins by expanding the stack by 8 bytes, simulating the presence of an error code for this exception (which does not inherently have one) and ensuring that RSP remains aligned to a 16-byte boundary. For an explanation of why this stack space is necessary see the subsection on <code>_MACHINE_FRAME</code> at the end.</p>
+<p>Next, the <code>ExceptionActive</code> field is set, and several general-purpose registers are saved into the trap frame. The final <code>test</code> instruction checks whether the CPU was already operating at CPL 0 when the exception occurred. This check will appear repeatedly throughout our analysis. As mentioned in the preface, we will follow the code paths for CPL 0.</p>
+<p>Since much of the upcoming code focuses on manipulating the trap frame let&rsquo;s take a brief detour to examine how it is constructed.</p>
+<h5 id="building-the-trap-frame">Building the trap frame</h5>
+<p>After executing the first two instructions in Figure 2, this is what the stack looks like:</p>
+<p><img src="/eh-pt1/eh-pt1/Diagrams-Stage2.png" alt="Figure 3"></p>
+<p><em>Figure 3: Machine frame, dummy error code and RBP pushed onto the stack, essentially forming the lower 56 bytes of <code>_KTRAP_FRAME</code></em></p>
+<p>Referring back to Figure 2, we allocated 344 (0x158) bytes on the stack. This size is significant because it corresponds to the default size of <code>_KTRAP_FRAME</code> on x64 (0x190) minus the 56 bytes (0x38) of information already collected (shown as color-coded entries in the diagram): 0x190 - 0x38 = 0x158.</p>
+<p>After this allocation during the prologue, the stack now looks as follows:
+<img src="/eh-pt1/Diagrams-Stage3.png" alt="Figure 4"></p>
+<p><em>Figure 4: Trap frame representation with some fields omitted</em></p>
+<p>Several of these fields will be populated during this function, while others may only be accessed or modified in later stages of the process.</p>
+<h4 id="the-kernel-path">The kernel path</h4>
+<p>As with the previous function, there are two main execution paths here. The first executes when the CPU was in user mode, the other when it was already in kernel mode.</p>
+<p>After skipping a few checks regarding speculation (specifically branch-prediction barrier, BPD), we end up at the following block:</p>
+<p><img src="/eh-pt1/20241104113136.png" alt="Figure 5"></p>
+<p><em>Figure 5: Saving XMM0-XMM5 onto the stack with aligned move instructions and re-enabling masked interrupts when applicable</em></p>
+<p>This block starts by clearing the direction flag, stores the old MXCSR<sup id="fnref:5"><a href="#fn:5" class="footnote-ref" role="doc-noteref">5</a></sup> into the trap frame and loads a new one from the PRCB. Several of the XMM registers are also saved on the trap frame using aligned moves. Afterwards, if SMAP<sup id="fnref:6"><a href="#fn:6" class="footnote-ref" role="doc-noteref">6</a></sup> is enabled, <strong>and</strong> the code originated from usermode, SMAP checks are suppressed as it may be necessary to access user memory (typically to copy the exception return information to the usermode stack down the line). Finally, maskable interrupts are re-enabled as they were disabled on entry during the pre-processing tasks since we are dealing with an interrupt gate.</p>
+<p>The last few blocks are all related to the collection of last branch from/to information from CPU MSRs. The last branch record (LBR) functionality is provided by both Intel and AMD (albeit in slightly different formats) and its purpose is to save the source and destination of branching (including interrupts and exceptions) instructions as they happen.</p>
+<p><img src="/eh-pt1/20241105082001.png" alt="Figure 6"></p>
+<p><em>Figure 6: Checking kernel tracing flags and whether the shadowed bits in DR7.LE and DR7.GE are enabled</em></p>
+<p>The orange block in the top-right section of the code enables the LBR (Last Branch Record) bit in the DEBUGCTL MSR (0x1D9 on AMD) and writes it back without altering the other bits. This operation is conditional on the value of the global <code>KiCpuTracingFlags</code> variable.</p>
+<p>The green-highlighted blocks will be our focus before transitioning to <code>KiExceptionDispatch</code>.</p>
+<p>When the RFLAGS.TF (Trap Flag) bit is set in the trap frame&rsquo;s flags image (indicating it was already enabled before the exception) there is a check on both DR7.GE and DR7.LE. Although these bits are unused in 64-bit mode, Windows developers repurposed them to alias the values of DEBUGCTL.LBR (Last Branch Record) and DEBUGCTL.BTF (Branch Trace Flag, which modifies the behavior of RFLAGS.TF for single-stepping branches).</p>
+<p>If all three conditions (RFLAGS.TF, DR7.GE, and DR7.LE) are met, Windows reads the branch source and destination addresses from the <code>LBR_FROM_IP</code> and <code>LBR_TO_IP</code> MSRs, respectively. These values are stored in <code>r9</code> and <code>r10</code>, then passed as arguments to <code>KiExceptionDispatch</code>. While this may seem redundant—since the MSRs could have been overwritten during branching—it is actually easily explainable: when a debug exception occurs the CPU automatically clears the DEBUGCTL.LBR, DEBUGCTL.BTF, and RFLAGS.TF bits. Hence, the values in the MSRs represent the state before the exception handler began executing.</p>
+<p>At the conclusion of <code>KxDebugTrapOrFault</code>, the RFLAGS.TF bit in the trap frame flags image is cleared, and <code>KiExceptionDispatch</code> is called. The following arguments are passed:</p>
+<ul>
+<li><code>rcx</code>: Exception code</li>
+<li><code>edx</code>: Number of parameters</li>
+<li><code>r8</code>: Exception address (<code>rip</code>)</li>
+<li><code>r9</code>, <code>r10</code> (and potentially <code>r11</code>): Exception parameters</li>
+</ul>
+<p>The last two instructions (<code>nop</code> and <code>ret</code>) are placeholders and should never execute since returning from an exception requires an explicit <code>IRETQ</code>.</p>
+<h3 id="kiexceptiondispatch"><code>KiExceptionDispatch</code></h3>
+<p>Very early on when <code>KxDebugTrapOrFault</code> was creating the trap frame it set <code>rbp</code> (see Figure 2) to point to <code>_KTRAP_FRAME.Xmm1</code>. From following the code up to this point it can be observed no changes have been made to <code>rbp</code>, meaning its value remains the same.</p>
+<p><img src="/eh-pt1/Diagrams-Stage5.png" alt="Figure 7"></p>
+<p><em>Figure 7: Post-call stack layout and where RBP points to</em></p>
+<p><img src="/eh-pt1/20241107104953.png" alt="Figure 8"></p>
+<p><em>Figure 8: The entry point of <code>KiExceptionDispatch</code>: allocating the second and third Kframes <code>_EXCEPTION_FRAME</code>, <code>_EXCEPTION_RECORD</code> and saving XMM6-XMM15</em></p>
+<p>Once again, we must be mindful of this starting block. This function starts by reserving a large space on the stack which will host our second and third Kframes: the exception frame (<code>_KEXCEPTION_FRAME</code><sup id="fnref:7"><a href="#fn:7" class="footnote-ref" role="doc-noteref">7</a></sup>) and the exception record (<code>_EXCEPTION_RECORD</code><sup id="fnref:8"><a href="#fn:8" class="footnote-ref" role="doc-noteref">8</a></sup>). The exception frame stores a variety of XMM and general-purpose registers, while the exception record describes some exception details such as:</p>
+<ul>
+<li>The number of exception arguments</li>
+<li>The faulting address</li>
+<li>The exception type (in this case, <code>STATUS_SINGLE_STEP</code> (<code>0x80000004</code>))</li>
+</ul>
+<blockquote>
+<p><em>Aside: At the end there is a check for the current thread&rsquo;s <code>Tcb.SystemAffinityActive</code> flag, but I&rsquo;m not sure what is the purpose of this flag although I&rsquo;m guessing it may be related to <code>KeSetSystemAffinityThread</code>/<code>Ex</code>? If you know please reach out.</em></p></blockquote>
+<p>After consolidating the diagram in regions we end up with the following:</p>
+<p><img src="/eh-pt1/Diagrams-Stage7.png" alt="Figure 9"></p>
+<p><em>Figure 9: Stack layout now including the exception frame and the exception record.</em></p>
+<p>Skipping code related to user-mode we find ourselves where the exception record is partially initialized and the parameters for calling <code>KiDispatchException</code> are set up.
+<img src="/eh-pt1/20241115065853.png" alt="Figure 9">
+<img src="/eh-pt1/20241113124306.png" alt="Figure 10"></p>
+<p><em>Figures 10 and 11: Populate the exception record and invoke <code>KiDispatchException</code></em></p>
+<p>Going through the highlighted areas:</p>
+<ol>
+<li>Initialize the exception record with the faulting address, the number of exception parameters and the parameters themselves in the <code>ExceptionInformation</code> array;</li>
+<li>Set <code>r9</code> to the previous mode the CPU was executing in; i.e., if it was in CPL 0 <code>r9</code> will be 0, otherwise 1;</li>
+<li>Remaining arguments:
+<ul>
+<li><code>rcx</code>: Exception record</li>
+<li><code>rdx</code>: Exception frame</li>
+<li><code>r8</code>: Trap frame</li>
+<li>For arguments beyond fifth and onward the Microsoft x64 ABI specifies they are passed through the stack. The <code>_KEXCEPTION_FRAME</code> occupies the top of the current stack, and its first five fields act as stand-ins for the parameter homing space and the first stack-based argument. Therefore, passing the fifth parameter to <code>KiDispatchException</code> is done by writing to the <code>P5</code> field of the exception frame, setting it to 1 to indicate a first chance exception.</li>
+</ul>
+</li>
+</ol>
+<p>Let&rsquo;s end this section with a short discussion about that last argument denoting a first or second chance exception. During the exception handling process there are two chances for a debugger to handle the exception:</p>
+<ol>
+<li>First chance: the debugger is informed of the exception and given an opportunity to handle it <strong><em>BEFORE</em></strong> any changes are made to the trapped execution context (e.g., stack unwinding and handler invocations).</li>
+<li>Second chance: if the exception remains unhandled after the first chance and the invocation of exception handlers the debugger is notified again. At this point the trapped context has likely been modified by the unwinding process.</li>
+</ol>
+<p>In practice, this means the debugger may observe a different trapped machine state depending on whether it inspects the exception details at the first or second chance.</p>
+<h4 id="kidispatchexception">KiDispatchException</h4>
+<p>This function is the last stage of setup before the exception is actually dispatched, and it is where the <code>_CONTEXT</code><sup id="fnref:9"><a href="#fn:9" class="footnote-ref" role="doc-noteref">9</a></sup> structure is created. A <code>_CONTEXT</code> encodes the entire volatile CPU state at some point in time, in this case at the time of the exception. This includes all GPRs, RIP, the XMM, some of the DEBUGCTL MSRs already discussed (<code>LBR_FROM_IP</code> and <code>LBR_TO_IP</code>) and potentially opaque fields. One interesting aspect about this structure is that its real size is dynamically calculated at runtime, with the stack expanding to accommodate its size depending on what CPU features are available.</p>
+<p><img src="/eh-pt1/20241113131023.png" alt="Figure 12"></p>
+<p><em>Figure 12: Stack setup and local variable initialization</em></p>
+<p>Start off by saving the non-volatile registers onto the stack. Store the exception frame, exception record, trap frame, the current thread (retrieved from <code>PCR-&gt;Prcb.CurrentThread</code>) and the current process (retrieved from <code>PCR-&gt;Prcb.CurrentThread-&gt;ApcState.Process</code>) in local variables.</p>
+<p>If this is a second chance exception, check whether the process is a Pico<sup id="fnref:10"><a href="#fn:10" class="footnote-ref" role="doc-noteref">10</a></sup> process, performing Pico-specific exception handling in that case.</p>
+<p>We assume a first chance exception, ending up here:
+<img src="/eh-pt1/20241113132813.png" alt="Figure 13"></p>
+<p><em>Figure 13: Searching for different CPU extensions that might require saving in <code>_CONTEXT</code> and calculate its real size</em></p>
+<p>If you have ever played around with the Win32 APIs <code>SetThreadContext</code> and <code>GetThreadContext</code> you might be familiar with the initial constant value which <code>context_flags</code> is set to in the green block. This is a bitmask exposed as the <code>CONTEXT_ALL</code> macro in both the Win32 and the kernel APIs. Its purpose is to specify to the <code>_CONTEXT</code> manipulation functions what information to store (when writing to <code>_CONTEXT</code>) and which one of the opaque <code>_CONTEXT</code> structures to utilize, required for proper size calculation. On this last note, earlier I alluded to the fact that the real size of <code>_CONTEXT</code> is calculated at runtime, and this is where it happens. By querying <code>_KUSER_SHARED_DATA</code> and the global variable <code>KeFeatureBits</code> for flags related to CPU extensions (such as AVX-512) and setting specific bits on the local variable <code>context_flags</code> when a feature is present, the call to <code>RtlGetExtendedContextLength2</code> will be able to calculate the real size.</p>
+<p>After getting the real context size, align it to a 16 byte boundary if required, zero<sup id="fnref:11"><a href="#fn:11" class="footnote-ref" role="doc-noteref">11</a></sup> the newly allocated memory if <code>previous_mode</code> is <code>User</code> and store a pointer to its start in a local variable.</p>
+<p>We are left with the stack expanded to now contain <code>_CONTEXT</code>:
+<img src="/eh-pt1/Diagrams-Stage8.png" alt="Figure 14"></p>
+<p><em>Figure 14: The stack so far, ready for the consolidation of the Kframes into <code>_CONTEXT</code> (local variables omitted for simplicity)</em></p>
+<p>Moving on, we get to the initialization and consolidation:
+<img src="/eh-pt1/20241113142724.png" alt="Figure 15"></p>
+<p><em>Figure 15: Initialize the <code>_CONTEXT</code>, taking into consideration the extension flags and data collected previously</em></p>
+<p>The presented blocks are the core of this function. With the stack now adjusted, the extended <code>_CONTEXT</code> is initialized with values depending on the CPU features present. The data in the trap frame, exception frame and exception record is now consolidated by <code>KeContextFromKframes</code> into <code>_CONTEXT</code>. All operations for the near future, including stack unwinding, will be performed on <code>_CONTEXT</code>. The distinct Kframes can still be relevant later on in certain cases, but for now forget about them.</p>
+<p>If the exception is a breakpoint (#BP—INT3), check for trace masks and emulate the trap instead of dispatching it. Remember that on the execution path we&rsquo;re following <code>_EXCEPTION_RECORD.ExceptionCode</code> was set to <code>STATUS_SINGLE_STEP</code> instead, meaning that we end up at the blue block where the arguments <code>_EXCEPTION_RECORD</code>, <code>_CONTEXT</code> and <code>previous_mode</code> are used to call <code>KiPreprocessFault</code>. This call is not entirely relevant given our previously established context (that is, we&rsquo;re interested in code relating to INT1), but I think it would be useful to make a short digression to understand its purpose. Feel free to skip this if you&rsquo;re not interested.</p>
+<hr>
+<p>Calling into <code>KiPreprocessFault</code> has three objectives:</p>
+<ol>
+<li>Attempt to find a more fitting exception code, replacing <code>_EXCEPTION_RECORD.ExceptionCode</code> if so;</li>
+<li>If the exception occurred as a result of popping (<code>InterlockedPopEntrySList</code>/<code>KeUserPopEntrySListFault</code>) from an interlocked singly linked list, handle the fault silently by setting <code>_CONTEXT.Rip</code> to <code>ExpInterlockedPopEntrySListResume</code> (kernel) or <code>KeUserPopEntrySListResume</code> (user).
+<ul>
+<li>In this case, after modifying the instruction pointer <code>KiPreprocessFault</code> returns <code>TRUE</code> which short-circuits its caller, <code>KiDispatchException</code>, and skips the rest of the exception handling procedure, eventually leading to an early <code>IRETQ</code>;</li>
+</ul>
+</li>
+<li>Decode the faulting instruction and attempt to understand what caused the fault, propagating any findings into the exception record</li>
+</ol>
+<hr>
+<p>In the last blocks of relevance we find the following code:
+<img src="/eh-pt1/20241113153239.png" alt="Figure 16"></p>
+<p><em>Figure 16: Attempt to notify a debugger of a first chance exception, dispatch the exception and notify of the second chance if still unhandled</em></p>
+<p>Earlier I talked about first and second chance exceptions, and in Figure 15 it becomes fairly self evident how they work and why they&rsquo;re called &ldquo;first&rdquo; and &ldquo;second&rdquo;. Starting off with &ldquo;first chance&rdquo; the kernel attempts to notify the debugger of the exception before any changes are made to saved CPU context. If the debugger accepts and handles this exception the rest of the process is ignored. If the exception remains unhandled after <code>RtlDispatchException</code> the debugger is given a second opportunity to handle this exception. Success in any of the three cases means the exception is considered handled. Failure in all three cases results in a bugcheck.</p>
+<h4 id="rtldispatchexception">RtlDispatchException</h4>
+<p>So far, we&rsquo;ve covered stacks, context records, trap frames, exception frames, and various other components. At this point, you might be wondering, &ldquo;Are we there yet?&rdquo; If that&rsquo;s on your mind, I have both good and bad news.</p>
+<p><strong>The good news</strong>: We&rsquo;re actually very close. In our next step, <code>RtlDispatchException</code>, everything will come together, and the exception handling and dispatching process will be completed, as promised.</p>
+<p><strong>The bad news</strong> (if you&rsquo;re in a hurry): Up until now, everything we&rsquo;ve discussed has been about preparing the environment by saving CPU state. Time-consuming, yes, but not particularly complicated. This next section is the final one, but it&rsquo;s also the most complex—consider everything we&rsquo;ve covered so far as a lengthy preamble leading to this point.</p>
+<p>I recommend taking a quick break and drinking some water before returning to finish the article.</p>
+<p>To start off, here&rsquo;s the function signature for <code>RtlDispatchException</code>:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">uint64_t</span> RtlDispatchException(<span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_EXCEPTION_RECORD</span><span style="color:#f92672">*</span>, <span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_CONTEXT</span><span style="color:#f92672">*</span>)
+</span></span></code></pre></div><p>And the entry:</p>
+<p><img src="/eh-pt1/20241118081257.png" alt="Figure 17"></p>
+<p><em>Figure 17: Initializing local variables and sanity checking the context stack pointer</em></p>
+<p>Another large stack expansion occurs (we&rsquo;ll see why shortly), local variables are zero-initialized, and the exception is logged based on a kernel flag. I&rsquo;ve named most of the variables, so the usage should be fairly clear, but the variable <code>dc</code> (<code>rbp+0x50</code>, highlighted in yellow) merits an early mention. This variable is of type <code>_DISPATCHER_CONTEXT</code> and will become a major part of the process when we reach the code responsible for dispatching the exception. I&rsquo;ll provide the type definition later, but for now, just keep its existence in mind.</p>
+<p>In the final block the kernel attempts to determine the <strong>current</strong> stack type and bounds using <code>KeQueryCurrentStackInformation</code>. Note: this refers to the <strong>current</strong> stack, not <code>_CONTEXT.Rsp</code>. The stack type is determined by checking if the current stack pointer lies within the bounds of any of the following:</p>
+<ol>
+<li><code>PCR-&gt;Prcb.IsrStack</code> — The stack used for interrupt service routines (ISR).</li>
+<li><code>PCR-&gt;Prcb.ExceptionStack</code> — The stack used for certain exceptions.</li>
+<li><code>PCR-&gt;Prcb.DpcStack</code> — A private stack for deferred procedure calls (DPC) on this CPU.</li>
+<li>The IST stack entry for vector 2 (NMI).</li>
+<li>The IST stack entry for vector 18 (#MC).</li>
+<li><code>PCR-&gt;Prcb.RspBase</code> — The active kernel stack for the CPU.</li>
+</ol>
+<p>This last entry has some variance in the return value written to the first output parameter of <code>KeQueryCurrentStackInformation</code>. The type may change depending on whether a callout is active or if the thread is a GUI (Win32) thread.</p>
+<p>After determining the stack type, the process is repeated, but this time using <code>_CONTEXT.Rsp</code> instead (<code>RtlpGetStackLimitsEx</code> simply calls <code>KeQueryCurrentStackInformationEx</code>). If the stack type and bounds can&rsquo;t be determined for the context RSP an early return happens and eventually a bugcheck.</p>
+<p><img src="/eh-pt1/20241113221828.png" alt="Figure 18"></p>
+<p><em>Figure 18: A (mostly) familiar sight</em></p>
+<p>Aside from initializing the unwind history table towards the end if this code seems familiar rest assured you&rsquo;re not going mad. <em>Another</em> context is being allocated here, but this time its contents are copied from the original by <code>RtlpCopyContext</code>.</p>
+<p><img src="/eh-pt1/20241113234102.png" alt="Figure 19"></p>
+<p><em>Figure 19: Finding the function entry, calling virtual unwind and sanity checking the stack bounds</em></p>
+<p>After copying, a call to <code>RtlLookupFunctionEntry</code> is made to locate both the function entry associated with the faulting RIP and the image base. This call can fail if the faulting RIP is within a leaf function, as leaf functions don&rsquo;t have unwind information or an associated exception handler. However, the call should succeed for any non-leaf function (and non-dynamic code), as the compiler generates a <code>RUNTIME_FUNCTION</code> (RT) entry for each one. The RT entry contains information about the function&rsquo;s bounds and the location of its unwind data. Below you can find the definition of <code>RUNTIME_FUNCTION</code>.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">RUNTIME_FUNCTION</span>
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">uint32_t</span> BeginAddress;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">uint32_t</span> EndAddress;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">union</span>
+</span></span><span style="display:flex;"><span>    {
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">uint32_t</span> UnwindInfoAddress;
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">uint32_t</span> UnwindData;
+</span></span><span style="display:flex;"><span>    };
+</span></span><span style="display:flex;"><span>};
+</span></span></code></pre></div><p>Having located <code>RUNTIME_FUNCTION</code> and initialized the cloned <code>_CONTEXT</code>, it&rsquo;s now time to call <code>RtlVirtualUnwind</code> with the faulting RIP and image base. This function is quite intricate, but broadly speaking, it serves three main purposes: identifying whether virtual frame unwinding is needed, performing the unwinding process itself, and retrieving the language-specific handler to handle the exception.</p>
+<p>To clarify, the key difference between a &ldquo;virtual&rdquo; and a &ldquo;real&rdquo; unwind is that the virtual unwind only modifies the <code>_CONTEXT</code> logically, without altering the actual CPU state. In contrast, a real unwind does the same thing, but at the end, the new state described by <code>_CONTEXT</code> is written back to the CPU registers using <code>RtlRestoreContext</code>.</p>
+<p>Let&rsquo;s take a moment to understand why the virtual unwind process is necessary. Exceptions can arise for many reasons, some of which can be handled seamlessly, allowing the program to resume execution. Several kernel APIs, for example, raise exceptions on failure, under the assumption that the caller has wrapped the call in a <code>__try/__except</code> block to handle the issue should the need arise. But what happens when an exception occurs deep within the call stack? Handling it at the faulting scope might not be enough, and in some cases, there might not be an exception handler available at that level. The unwind process solves this by recursively traversing the call stack, recovering the non-volatile state at each level, and locating the appropriate handler if one exists. This continues through each stack frame until the exception is either handled or the system bugchecks due to invalid access.</p>
+<p>Since this entire process was split into three discrete steps let&rsquo;s work through each one individually.</p>
+<hr>
+<h5 id="1-identifying-the-unwind-type-full-partial-or-none">1. Identifying the Unwind Type: Full, Partial, or None</h5>
+<p>When an exception occurs, <code>RtlVirtualUnwind</code> must determine whether the frame should be fully unwound, partially unwound, or left untouched. Exceptions raised during a function&rsquo;s prologue may not require unwinding all the stack pointer adjustments, since not all changes have been made. Conversely, if an exception occurs during the epilogue, after some non-volatile registers have already been restored, only a partial unwind is needed. These cases result in three distinct possibilities:</p>
+<ol>
+<li>Exception raised in the prologue</li>
+<li>Exception raised in an epilogue</li>
+<li>Exception raised within the function body</li>
+</ol>
+<p>The first step in the unwinding process is identifying the case, which involves disassembling the instruction stream starting from <code>_CONTEXT.Rip</code>. The goal is to identify whether the fault is in its prologue, epilogue, or body. While this might initially seem difficult, the ABI restricts the instructions that can appear in the epilogue and the size of the prologue is stored as part of the unwind data, making the task manageable.</p>
+<h5 id="prologue">Prologue:</h5>
+<p>The size of the prologue is stored in the functions unwind information block. With the function bounds available (RT) it is trivial to check whether RIP lies within <code>[BeginAddress, BeginAddress + UnwindInfo.SizeOfProlog]</code>.</p>
+<h5 id="epilogue">Epilogue:</h5>
+<p>An epilogue is limited in what instructions it can include. Namely, these are:</p>
+<ul>
+<li><code>pop reg</code> — Restores a non-volatile general-purpose register</li>
+<li><code>ret</code> — Returns to the caller (including variations such as <code>ret n</code> and <code>rep ret</code>)</li>
+<li><code>lea rsp, [reg-constant]</code> — When using a frame pointer</li>
+<li><code>jmp imm8/imm32</code> — Jump to a target outside the function</li>
+<li><code>rex.w jmp reg</code> — When the jump uses a 64-bit register</li>
+</ul>
+<p>Note how neither <code>sub rsp, N</code> nor <code>add rsp, N</code> are considered part of the prologue or epilogue.</p>
+<p>If an exception occurs partway through the function prologue, only the instructions that have already been executed are unwound. Conversely, if an epilogue is matched instead, the unwinding process skips the executed instructions and processes only the remaining prologue steps. If neither the prologue nor the epilogue matches, the exception is assumed to have occurred within the function body, and standard stack unwinding proceeds as usual.</p>
+<blockquote>
+<p>Side note: These rules assume code follows the ABI. Hand-written assembly might not always adhere to these rules.</p></blockquote>
+<h5 id="2-perform-the-virtual-unwind-on-the-cloned-_context">2. Perform the Virtual Unwind on the Cloned <code>_CONTEXT</code></h5>
+<p>Assuming the exception occurred mid-function, the unwind information (<code>UnwindData</code>) associated with the faulting function, part of the earlier obtained <code>RUNTIME_FUNCTION</code>, is now ready for interpretation. This unwind information can be roughly split into two parts:</p>
+<ol>
+<li>Unwind Codes: The first part consists of a list of unwind codes, each corresponding to an operation that either modifies the stack pointer or saves a non-volatile register to the stack. These codes determine how the stack should be unwound.</li>
+<li>Exception Handling Information: The second part describes the presence of any <code>__try</code>/<code>__except</code> (exception handlers) or <code>__try/__finally</code> (unwind handlers) pairs in the function.</li>
+</ol>
+<p>The definitions for all relevant types are provided below.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">typedef</span> <span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_SCOPE_TABLE_AMD64</span> {
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">uint32_t</span> Count;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">struct</span> {
+</span></span><span style="display:flex;"><span>        <span style="color:#66d9ef">uint32_t</span> BeginAddress;   <span style="color:#75715e">// Start address of the `__try` block
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>        <span style="color:#66d9ef">uint32_t</span> EndAddress;     <span style="color:#75715e">// End address of the scope
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>        <span style="color:#66d9ef">uint32_t</span> HandlerAddress; <span style="color:#75715e">// Either the `__except` block, the `__finally` block or an exception filter.
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>        <span style="color:#66d9ef">uint32_t</span> JumpTarget;     <span style="color:#75715e">// If `HandlerAddress` represented an exception filter this field is the actual `__except` block.
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    } ScopeRecord[<span style="color:#ae81ff">1</span>];
+</span></span><span style="display:flex;"><span>} SCOPE_TABLE, <span style="color:#f92672">*</span>PSCOPE_TABLE;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">union</span> <span style="color:#a6e22e">UNWIND_CODE</span> {
+</span></span><span style="display:flex;"><span>  <span style="color:#66d9ef">struct</span> {
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">uint8_t</span> CodeOffset;          <span style="color:#75715e">// Offset relative to the prologue where this operation is located
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    <span style="color:#66d9ef">uint8_t</span> UnwindOp : <span style="color:#ae81ff">4</span>;        <span style="color:#75715e">// Type of operation being performed
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    <span style="color:#66d9ef">uint8_t</span> OpInfo   : <span style="color:#ae81ff">4</span>;        <span style="color:#75715e">// Extra data, value depends on what `UnwindOp` is
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  };
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>  <span style="color:#66d9ef">uint16_t</span> FrameOffset;
+</span></span><span style="display:flex;"><span>};
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span><span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">UNWIND_INFO</span> {
+</span></span><span style="display:flex;"><span>  <span style="color:#66d9ef">uint8_t</span>     Version : <span style="color:#ae81ff">3</span>;       <span style="color:#75715e">// Version number of unwind data
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  <span style="color:#66d9ef">uint8_t</span>     Flags   : <span style="color:#ae81ff">5</span>;       <span style="color:#75715e">// Whether function has an exception (or termination) handler that must be invoked, or this is part of a chained unwind operation
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  <span style="color:#66d9ef">uint8_t</span>     SizeOfProlog;      <span style="color:#75715e">// Total length of the function prologue, in bytes
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  <span style="color:#66d9ef">uint8_t</span>     CountOfCodes;      <span style="color:#75715e">// Number of `UNWIND_CODE`s following `UnwindCode`
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  <span style="color:#66d9ef">uint8_t</span>     FrameRegister : <span style="color:#ae81ff">4</span>; <span style="color:#75715e">// Whether the function utilizes a frame pointer for stack accesses and what register it is
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  <span style="color:#66d9ef">uint8_t</span>     FrameOffset   : <span style="color:#ae81ff">4</span>; <span style="color:#75715e">// When using a frame register, this field contains the scaled down offset from RSP applied to the frame register
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  UNWIND_CODE UnwindCode[ <span style="color:#ae81ff">1</span> ];   <span style="color:#75715e">// `CountOfCodes` unwind codes
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  <span style="color:#75715e">/*
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">	The format of the region below varies depending on the exception type. This layout is for SEH only.
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e">  */</span>
+</span></span><span style="display:flex;"><span>  <span style="color:#66d9ef">uint32_t</span> ExceptionHandler;     <span style="color:#75715e">// &lt;---- Value returned by `RtlVirtualUnwind`
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>  SCOPE_TABLE ScopeTable;        <span style="color:#75715e">// Table of `__try`/`__except` or `__try/__finally` pairs
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>};
+</span></span></code></pre></div><p>Let&rsquo;s manually work through a quick example to understand the process.</p>
+<p>Consider the following prologue:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-asm" data-lang="asm"><span style="display:flex;"><span><span style="color:#a6e22e">mov</span>     <span style="color:#66d9ef">rax</span>, <span style="color:#66d9ef">rsp</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">mov</span>     <span style="color:#66d9ef">qword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax</span><span style="color:#960050;background-color:#1e0010">+</span><span style="color:#ae81ff">0x8</span>], <span style="color:#66d9ef">rbx</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">mov</span>     <span style="color:#66d9ef">qword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax</span><span style="color:#960050;background-color:#1e0010">+</span><span style="color:#ae81ff">0x10</span>], <span style="color:#66d9ef">rsi</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">mov</span>     <span style="color:#66d9ef">qword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax</span><span style="color:#960050;background-color:#1e0010">+</span><span style="color:#ae81ff">0x18</span>], <span style="color:#66d9ef">rdi</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">push</span>    <span style="color:#66d9ef">rbp</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">push</span>    <span style="color:#66d9ef">r12</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">push</span>    <span style="color:#66d9ef">r13</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">push</span>    <span style="color:#66d9ef">r14</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">push</span>    <span style="color:#66d9ef">r15</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">lea</span>     <span style="color:#66d9ef">rbp</span>, <span style="color:#66d9ef">qword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax-0x6f8</span>]
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">sub</span>     <span style="color:#66d9ef">rsp</span>, <span style="color:#ae81ff">0x7d0</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">movaps</span>  <span style="color:#66d9ef">xmmword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax-0x38</span>], <span style="color:#66d9ef">xmm6</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">movaps</span>  <span style="color:#66d9ef">xmmword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax-0x48</span>], <span style="color:#66d9ef">xmm7</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">movaps</span>  <span style="color:#66d9ef">xmmword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax-0x58</span>], <span style="color:#66d9ef">xmm8</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">movaps</span>  <span style="color:#66d9ef">xmmword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax-0x68</span>], <span style="color:#66d9ef">xmm9</span>
+</span></span><span style="display:flex;"><span><span style="color:#a6e22e">movaps</span>  <span style="color:#66d9ef">xmmword</span> <span style="color:#66d9ef">ptr</span> [<span style="color:#66d9ef">rax-0x78</span>], <span style="color:#66d9ef">xmm10</span>
+</span></span></code></pre></div><p>This prologue includes 5 pushes, a stack allocation of 0x7d0 bytes and the saving of both 8-byte and 16-byte values. The <code>mov</code> instructions store non-volatile registers in shadow space (also known as home space), while the <code>movaps</code> instructions store 16-byte values. The remaining stack allocation of 0x7d0 bytes, along with 5 pushes of 8 bytes each, adds up to 0x7f8 bytes. As a result, an initial RSP of <code>0x83C84FFC00</code> will become <code>0x83C84FF408</code> after the prologue finishes.</p>
+<p>The equivalent unwind codes for the same prologue would look like this:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-text" data-lang="text"><span style="display:flex;"><span>.SAVEXMM128 XMM10, 0x780
+</span></span><span style="display:flex;"><span>.SAVEXMM128 XMM9, 0x790
+</span></span><span style="display:flex;"><span>.SAVEXMM128 XMM8, 0x7a0
+</span></span><span style="display:flex;"><span>.SAVEXMM128 XMM7, 0x7b0
+</span></span><span style="display:flex;"><span>.SAVEXMM128 XMM6, 0x7c0
+</span></span><span style="display:flex;"><span>.SAVEREG RDI, 0x810
+</span></span><span style="display:flex;"><span>.SAVEREG RSI, 0x808
+</span></span><span style="display:flex;"><span>.SAVEREG RBX, 0x800
+</span></span><span style="display:flex;"><span>.ALLOCSTACK 0x7d0
+</span></span><span style="display:flex;"><span>.PUSHREG R15
+</span></span><span style="display:flex;"><span>.PUSHREG R14
+</span></span><span style="display:flex;"><span>.PUSHREG R13
+</span></span><span style="display:flex;"><span>.PUSHREG R12
+</span></span><span style="display:flex;"><span>.PUSHREG RBP
+</span></span></code></pre></div><p><img src="/eh-pt1/Diagrams-UnwindOperations.png" alt="Figure 19"></p>
+<p><em>Figure 18: Relationship between unwind codes and prologue instructions at the top. Example mapping between an unwind code and the C union at the bottom.</em></p>
+<p>To undo the changes made during the function&rsquo;s prologue we need to reverse the adjustments to the stack pointer (RSP) and restore the original state, which was <code>0x83C84FFC00</code>. Since we are assuming the exception occurred in the middle of the function, <code>_CONTEXT.Rsp</code> will hold the value after the prologue (<code>0x83C84FF408</code>).</p>
+<p>Interpreting the unwind codes step-by-step:</p>
+<ol>
+<li>Read 16 bytes from <code>_CONTEXT.Rsp - 0x780</code>, store in <code>_CONTEXT.Xmm10</code></li>
+<li>Read 16 bytes from <code>_CONTEXT.Rsp - 0x790</code>, store in <code>_CONTEXT.Xmm9</code></li>
+<li>Read 16 bytes from <code>_CONTEXT.Rsp - 0x7a0</code>, store in <code>_CONTEXT.Xmm8</code></li>
+<li>Read 16 bytes from <code>_CONTEXT.Rsp - 0x7b0</code>, store in <code>_CONTEXT.Xmm7</code></li>
+<li>Read 16 bytes from <code>_CONTEXT.Rsp - 0x7c0</code>, store in <code>_CONTEXT.Xmm6</code></li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp - 0x810</code>, store in <code>_CONTEXT.Rdi</code></li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp - 0x810</code>, store in <code>_CONTEXT.Rsi</code></li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp - 0x810</code>, store in <code>_CONTEXT.Rbx</code></li>
+<li>Add 0x7d0 to <code>_CONTEXT.Rsp</code>. After this operation, the stack pointer is updated to <code>0x83C84FFBD8</code>;</li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp</code> (<code>0x83C84FFBD8</code>), write to <code>_CONTEXT.R15</code>. Increment <code>_CONTEXT.Rsp</code> by 8;</li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp</code> (<code>0x83C84FFBE0</code>), write to <code>_CONTEXT.R14</code>. Increment <code>_CONTEXT.Rsp</code> by 8;</li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp</code> (<code>0x83C84FFBE8</code>), write to <code>_CONTEXT.R13</code>. Increment <code>_CONTEXT.Rsp</code> by 8;</li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp</code> (<code>0x83C84FFBF0</code>), write to <code>_CONTEXT.R12</code>. Increment <code>_CONTEXT.Rsp</code> by 8;</li>
+<li>Read 8 bytes from <code>_CONTEXT.Rsp</code> (<code>0x83C84FFBF8</code>), write to <code>_CONTEXT.Rbp</code>. Increment <code>_CONTEXT.Rsp</code> by 8;</li>
+</ol>
+<p>By the time the last operation is completed, the stack pointer has been restored to its original state, ensuring the stack is unwound correctly and the process can continue.</p>
+<h5 id="3-retrieve-the-language-specific-handler">3. Retrieve the language-specific handler</h5>
+<p>The final step in the <code>RtlVirtualUnwind</code> process involves locating the language-specific exception handler, which is done after all the unwind codes have been processed and is <code>RtlVirtualUnwind</code>&rsquo;s return value. This handler is a function specific to the programming language or runtime in use. We are only concerned with the SEH handler which we will assume to be the C language handler function, <code>__C_specific_handler</code>. However, depending on the environment or compiler settings, other handlers like the <code>__GSHandlerCheck</code> may also be used to ensure integrity of the stack cookie before calling <code>__C_specific_handler</code>.</p>
+<hr>
+<p>To summarize the current stage of the process:</p>
+<ol>
+<li>The faulting function was identified.</li>
+<li>The cloned <code>_CONTEXT</code> was updated to reflect the non-volatile state of the caller after the unwinding process and the original RSP has been restored.</li>
+<li>The language-specific exception handler was successfully located via <code>RtlVirtualUnwind</code>.</li>
+</ol>
+<p>After <code>RtlVirtualUnwind</code>, this is where we are:</p>
+<p><img src="/eh-pt1/20241118100713.png" alt="Figure 20"></p>
+<p><em>Figure 20: Setting up the dispatcher context and executing the exception handler, essentially completing the exception dispatch.</em></p>
+<p>At this stage, system is preparing to invoke the language-specific exception handler (cyan highlighted block) and the dispatcher context is initialized (orange block). To reiterate, we are assuming the language handler is <code>__C_specific_handler</code> for the purposes of this example.</p>
+<p>The signature of the handler function follows.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">typedef</span> <span style="color:#66d9ef">enum</span> <span style="color:#a6e22e">_EXCEPTION_DISPOSITION</span>
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    ExceptionContinueExecution,
+</span></span><span style="display:flex;"><span>    ExceptionContinueSearch,
+</span></span><span style="display:flex;"><span>    ExceptionNestedException,
+</span></span><span style="display:flex;"><span>    ExceptionCollidedUnwind
+</span></span><span style="display:flex;"><span>} EXCEPTION_DISPOSITION;
+</span></span><span style="display:flex;"><span>
+</span></span><span style="display:flex;"><span>EXCEPTION_DISPOSITION <span style="color:#a6e22e">__C_specific_handler</span>(
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_EXCEPTION_RECORD</span>    <span style="color:#f92672">*</span>ExceptionRecord,
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">void</span>                        <span style="color:#f92672">*</span>EstablisherFrame,
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_CONTEXT</span>             <span style="color:#f92672">*</span>ContextRecord,
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_DISPATCHER_CONTEXT</span>  <span style="color:#f92672">*</span>DispatcherContext
+</span></span><span style="display:flex;"><span>);
+</span></span></code></pre></div><p>The arguments passed to the handler are:</p>
+<ul>
+<li><code>rcx</code>: The exception record, which holds information about the exception event.</li>
+<li><code>rdx</code>: The stack pointer (RSP) at the time the exception occurred.</li>
+<li><code>r8</code>: The cloned <code>_CONTEXT</code>, which has been modified by the unwinding process.</li>
+<li><code>r9</code>: The dispatcher context (<code>_DISPATCHER_CONTEXT</code>).</li>
+</ul>
+<p>At the start of the section I mentioned that the dispatcher context would be an important part of this stage, and now we will discuss it. Below is the type definition, followed by an explanation of the relevant fields and their usage.</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">typedef</span> <span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_DISPATCHER_CONTEXT</span> {
+</span></span><span style="display:flex;"><span>    DWORD64 ControlPc;
+</span></span><span style="display:flex;"><span>    DWORD64 ImageBase;
+</span></span><span style="display:flex;"><span>    PRUNTIME_FUNCTION FunctionEntry;
+</span></span><span style="display:flex;"><span>    DWORD64 EstablisherFrame;
+</span></span><span style="display:flex;"><span>    DWORD64 TargetIp;
+</span></span><span style="display:flex;"><span>    PCONTEXT ContextRecord;
+</span></span><span style="display:flex;"><span>    PEXCEPTION_ROUTINE LanguageHandler;
+</span></span><span style="display:flex;"><span>    PVOID HandlerData;
+</span></span><span style="display:flex;"><span>    <span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_UNWIND_HISTORY_TABLE</span> <span style="color:#f92672">*</span>HistoryTable;
+</span></span><span style="display:flex;"><span>    DWORD ScopeIndex;
+</span></span><span style="display:flex;"><span>    DWORD Fill0;
+</span></span><span style="display:flex;"><span>} DISPATCHER_CONTEXT, <span style="color:#f92672">*</span>PDISPATCHER_CONTEXT;
+</span></span></code></pre></div><p>Top to bottom:</p>
+<ul>
+<li><code>ControlPc</code>: This is the address of the faulting instruction</li>
+<li><code>ImageBase</code>: The base address of the faulting image, used to calculate absolute addresses from RVAs</li>
+<li><code>FunctionEntry</code>: Bounds and unwind data for the faulting function</li>
+<li><code>EstablisherFrame</code>: Represents the original RSP of the faulting function.</li>
+<li><code>TargetIp</code>: Zero for our purposes.</li>
+<li><code>LanguageHandler</code>: The address of the language handler returned by <code>RtlVirtualUnwind</code>, assumed to be <code>__C_specific_handler</code>.</li>
+<li><code>HandlerData</code>: A pointer to the scope table.</li>
+<li><code>HistoryTable</code>: A cache used for successive unwinding operations, reducing potentially redundant work in processing consecutive unwinds.</li>
+<li><code>ScopeIndex</code>: The index in the scope table of the last exception handler invoked. This is incremented by language handler for each processed scope.</li>
+</ul>
+<p>The purpose of the dispatcher context is to store state across consecutive unwinds such as the unwind history table and the index of the most recently processed scope in the table, reducing potentially redundant work over recurring unwinds.</p>
+<p>With everything set up, <code>RtlpExecuteHandlerForException</code> is invoked with the exception record (<code>rcx</code>), the establisher frame (<code>rdx</code>), cloned <code>_CONTEXT</code> (<code>r8</code>) and dispatcher context (<code>r9</code>). This function is a short wrapper around an indirect call to the language handler, but since it has its own exception handler it serves an important purpose which is to report nested exceptions, cases when an exception happens while handling another.</p>
+<p>The return type of the handler function is <code>EXCEPTION_DISPOSITION</code>, which indicates the state of the exception after the handler finishes execution. This is determines the behavior of <code>RtlDispatchException</code> once the handler returns as we will soon see.</p>
+<p>The values we are concerned with are:</p>
+<ul>
+<li><code>ExceptionContinueExecution</code>: The exception is considered handled, and no further handlers will be invoked. Execution resumes at the faulting instruction pointer. This option is only valid for some exception types such as in our case of <code>STATUS_SINGLE_STEP</code>/INT1.</li>
+<li><code>ExceptionContinueSearch</code>: The exception handler was either unable to handle the reported exception or declined it altogether. The unwinding process will continue for the next stack frame (i.e., the caller of the faulting function).</li>
+<li><code>ExceptionNestedException</code>: Another exception occurred during the execution of the handler. This is disposition is reported by the exception handler for <code>RtlpExecuteHandlerForException</code>: <code>RtlpExceptionHandler</code>.</li>
+</ul>
+<p>After being called, the language handler iterates through the scope table, looking for the smallest scope that encompasses the faulting instruction. If this is not its first invocation with the given dispatcher context, the search begins at <code>_DISPATCHER_CONTEXT.ScopeIndex</code>; otherwise, it starts from the beginning. When the target scope is identified, there are two primary scenarios to handle:</p>
+<ol>
+<li>Unconditional exception handler found</li>
+</ol>
+<p>If <code>ScopeRecord.HandlerAddress</code> equals <code>1</code>, the handler interprets this as an unconditional exception handler. In such cases, <code>ScopeRecord.JumpTarget</code> is used to process the exception instead.</p>
+<p>This corresponds to code like the following:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">__try</span> {
+</span></span><span style="display:flex;"><span>	<span style="color:#75715e">/* Raises STATUS_ACCESS_VIOLATION on failure */</span>
+</span></span><span style="display:flex;"><span>	MmProbeAndLockPages(...);
+</span></span><span style="display:flex;"><span>} <span style="color:#66d9ef">__except</span> ( EXCEPTION_EXECUTE_HANDLER ) {
+</span></span><span style="display:flex;"><span>	...
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><ol start="2">
+<li>Conditional exception handler found</li>
+</ol>
+<p>In this case, the filter associated with the handler must first determine if the exception should be processed. The compiler generates a small function encapsulating the filter expression logic which is called. This filter returns a &ldquo;disposition&rdquo; value, (confusingly) distinct from the previously discussed. The SDK defines three valid states for this value: <code>EXCEPTION_CONTINUE_SEARCH</code>, <code>EXCEPTION_CONTINUE_EXECUTION</code> and <code>EXCEPTION_EXECUTE_HANDLER</code>. The former two have meanings similar to what we&rsquo;ve discussed when talking about the <code>EXCEPTION_DISPOSITION</code> enum. The latter is used to signal acceptance of the exception.</p>
+<p>Example:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">__try</span> {
+</span></span><span style="display:flex;"><span>	ExRaiseStatus( STATUS_BREAKPOINT );
+</span></span><span style="display:flex;"><span>} <span style="color:#66d9ef">__except</span> ( GetExceptionCode( ) <span style="color:#f92672">==</span> STATUS_BREAKPOINT ) {
+</span></span><span style="display:flex;"><span>	...
+</span></span><span style="display:flex;"><span>}
+</span></span></code></pre></div><p>A separate scenario arises when a function includes only termination handlers, which the compiler tags as having unwind handlers but no exception handlers. Termination handlers alone are excluded from the above discussion.</p>
+<p>Assuming either the filter accepted the exception or an unconditional handler was found we find ourselves at the finishing line.</p>
+<p><img src="/eh-pt1/20241118153253.png" alt="Figure 21"></p>
+<p><em>Figure 21: The rather anti-climatic point where the exception is finally handled.</em></p>
+<p>This is it. The call to <code>RtlUnwindEx</code> is the final step of the process and if it successfully completes the CPU will resume execution at the <code>__except</code> block inside whatever function accepted the exception. I won&rsquo;t thoroughly dive into <code>RtlUnwindEx</code> and the reason is quite simple. We&rsquo;ve already covered the overwhelming majority of what it does in the section about virtual unwinding. Nevertheless, there are still some important differences between the virtual and real unwind and I will discuss those.</p>
+<p>First, let&rsquo;s review its function signature:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#66d9ef">void</span> <span style="color:#a6e22e">RtlUnwindEx</span>(
+</span></span><span style="display:flex;"><span>  <span style="color:#66d9ef">void</span>                  <span style="color:#f92672">*</span>TargetFrame,
+</span></span><span style="display:flex;"><span>  <span style="color:#66d9ef">void</span>                  <span style="color:#f92672">*</span>TargetIp,
+</span></span><span style="display:flex;"><span>  _EXCEPTION_RECORD     <span style="color:#f92672">*</span>ExceptionRecord,
+</span></span><span style="display:flex;"><span>  <span style="color:#66d9ef">void</span>                  <span style="color:#f92672">*</span>ReturnValue,
+</span></span><span style="display:flex;"><span>  _CONTEXT              <span style="color:#f92672">*</span>ContextRecord,
+</span></span><span style="display:flex;"><span>  _UNWIND_HISTORY_TABLE <span style="color:#f92672">*</span>HistoryTable
+</span></span><span style="display:flex;"><span>);
+</span></span></code></pre></div><p>We are primarily interested in <code>TargetFrame</code>, <code>TargetIp</code>, and <code>ContextRecord</code>. Earlier, I explained that virtual unwinding recursively processes stack frames until a handler accepts the exception or a memory error causes a crash. <code>RtlUnwindEx</code> exploits this property to finalize the unwinding process. Once it determines where to resume execution, <code>RtlUnwindEx</code> iteratively calls <code>RtlVirtualUnwind</code>, invoking any handlers (e.g., <code>__finally</code> for unwind and <code>__except</code> for exceptions) it encounters. This continues until <code>ContextRecord.Rsp</code> matches <code>TargetFrame</code>, which corresponds to the RSP of the exception handler function. With the context properly unwound the process is completed by calling <code>RtlGuardRestoreContext</code>, which eventually calls <code>RtlRestoreContext</code> to set the CPU state and execute <code>IRETQ</code>.</p>
+<p><img src="/eh-pt1/20241118164904.png" alt="Figure 22"></p>
+<p><em>Figure 22: CPU context being restored</em></p>
+<h2 id="conclusion">Conclusion</h2>
+<p>This ended up being a very large article, much larger than what I planned for, even when purposefully skipping over a bunch of information. Hopefully there will be future opportunities to discuss everything I glossed over, but for now this is it. If something is unclear or outright incorrect please reach out to me on Discord (same handle as GitHub).</p>
+<p>Thanks for reading!</p>
+<p>:wq</p>
+<hr>
+<h2 id="concepts-and-glossary">Concepts and glossary</h2>
+<h3 id="background">Background</h3>
+<h4 id="_machine_frame"><code>_MACHINE_FRAME</code></h4>
+<p>The first concept that must be introduced is what Windows calls a <code>_MACHINE_FRAME</code><sup id="fnref:12"><a href="#fn:12" class="footnote-ref" role="doc-noteref">12</a></sup>:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-c" data-lang="c"><span style="display:flex;"><span><span style="color:#75715e">//0x28 bytes (sizeof)
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span><span style="color:#66d9ef">struct</span> _MACHINE_FRAME
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    ULONGLONG Rip;                                                          <span style="color:#75715e">//0x0
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT SegCs;                                                           <span style="color:#75715e">//0x8
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT Fill1[<span style="color:#ae81ff">3</span>];                                                        <span style="color:#75715e">//0xa
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONG EFlags;                                                           <span style="color:#75715e">//0x10
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONG Fill2;                                                            <span style="color:#75715e">//0x14
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONGLONG Rsp;                                                          <span style="color:#75715e">//0x18
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT SegSs;                                                           <span style="color:#75715e">//0x20
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT Fill3[<span style="color:#ae81ff">3</span>];                                                        <span style="color:#75715e">//0x22
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>};
+</span></span></code></pre></div><p>It comprises the most basic information required by in order to resume execution after interrupt handling completes. These values are automatically pushed onto the stack by the CPU when an interrupt occurs. The layout is consistent due to being enforced by the architecture. This is how the manual defines it<sup id="fnref:13"><a href="#fn:13" class="footnote-ref" role="doc-noteref">13</a></sup><sup id="fnref:14"><a href="#fn:14" class="footnote-ref" role="doc-noteref">14</a></sup>:</p>
+<p><img src="/eh-pt1/20241025075139.png" alt="_MACHINE_FRAME"></p>
+<p>As can be seen in this figure, there are two possible layouts for the function: One including an error code, and the other with no error code. Windows only ever utilizes the former, and manually reserves stack space to account for the missing error code when required.</p>
+<h4 id="task-state-segment">Task State Segment</h4>
+<p>The TSS is a structure that has existed since the 32 bit days. It was utilized to provide hardware-based task management (scheduling). In x64, there is no support for hardware task management, but creating and initializing one TSS per CPU is still required. Without task management, the structure is instead repurposed to store the 7 IST stacks (discussed below) as well as the stack pointer utilized in privilege changes. Like other low level tables such as the GDT and IDT, there is only one TSS per CPU. Its layout as shown in the manual as well as the Windows structure can be found below.<sup id="fnref:15"><a href="#fn:15" class="footnote-ref" role="doc-noteref">15</a></sup></p>
+<p><img src="/eh-pt1/20241030091250.png" alt="TSS64"></p>
+<p>And the Windows structure<sup id="fnref:16"><a href="#fn:16" class="footnote-ref" role="doc-noteref">16</a></sup>:</p>
+<div class="highlight"><pre tabindex="0" style="color:#f8f8f2;background-color:#272822;-moz-tab-size:4;-o-tab-size:4;tab-size:4;"><code class="language-cpp" data-lang="cpp"><span style="display:flex;"><span><span style="color:#75715e">//0x68 bytes (sizeof)
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span><span style="color:#66d9ef">struct</span> <span style="color:#a6e22e">_KTSS64</span>
+</span></span><span style="display:flex;"><span>{
+</span></span><span style="display:flex;"><span>    ULONG Reserved0;                                                        <span style="color:#75715e">//0x0
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONGLONG Rsp0;                                                         <span style="color:#75715e">//0x4
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONGLONG Rsp1;                                                         <span style="color:#75715e">//0xc
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONGLONG Rsp2;                                                         <span style="color:#75715e">//0x14
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONGLONG Ist[<span style="color:#ae81ff">8</span>];                                                       <span style="color:#75715e">//0x1c
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    ULONGLONG Reserved1;                                                    <span style="color:#75715e">//0x5c
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT Reserved2;                                                       <span style="color:#75715e">//0x64
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>    USHORT IoMapBase;                                                       <span style="color:#75715e">//0x66
+</span></span></span><span style="display:flex;"><span><span style="color:#75715e"></span>};
+</span></span></code></pre></div><h4 id="interrupt-stack-table">Interrupt Stack Table</h4>
+<p>The IST part of the 64-bit extension to the x86 TSS and its job is to provide a known-good stack for certain interrupts/exceptions. Whether this feature is utilized at all by an exception (and which of the 7 entries is picked) is configured by the operating system by setting specific fields in the interrupt (or exception) gate.</p>
+<p>For our purposes, it is sufficient to know this mechanism exists and, when enabled, is unconditionally utilized by the CPU.</p>
+<h4 id="interrupt-descriptor-table">Interrupt Descriptor Table</h4>
+<p>The CPU needs a way to know which OS functions to call when an interrupt or exception occurs. On x64, this information is stored in the interrupt descriptor table (IDT) which is set up by the OS during the early boot process.</p>
+<p>The IDT, a pointer to which is stored in upper 8 bytes of the register <code>IDTR</code>, contains gates for all the possible 256 interrupt and exception vectors with the first 32 entries reserved for the CPU. Of the total 256 entries, some are used for exceptions, others for software interrupts and the rest for hardware interrupts. Note that not all entries might be in use in a given system. Below you can find the entirely-not-convoluted layout for an IDT gate.</p>
+<p><img src="/eh-pt1/20241112083820.png" alt="IDT64"></p>
+<h4 id="frame-unwinding">Frame unwinding</h4>
+<p>Unwinding is the process of restoring the stack pointer (RSP) of a function back to its value on entry by restoring its original value and recovering the non-volatile register state when an exception occurs.</p>
+<h4 id="leaf-function">Leaf function</h4>
+<p>A function is considered a &ldquo;leaf function&rdquo; when it does not call any other functions in its body, nor reserves any stack space of its own. Because the stack pointer remains unchanged no unwinding is required and determining the return address is trivial.</p>
+<h4 id="non-leaf-function">Non-leaf function</h4>
+<p>A function is considered a &ldquo;non-leaf function&rdquo; when it either calls other functions in its body or reserves stack space for local variables. Because such functions are obligated by the ABI to allocate varying amounts of stack space (in addition to the local variables) determining their return address reliably requires unwinding the stack.</p>
+<hr>
+<p>References:</p>
+<ul>
+<li>Feryno (2007). <a href="http://x86asm.net/articles/backdoor-support-for-control-transfer-breakpoint-features/">Backdoor Support for Control-Transfer Breakpoint Features in Windows x64</a> (<a href="https://web.archive.org/web/20220627181816/http://x86asm.net/articles/backdoor-support-for-control-transfer-breakpoint-features/">archive</a>)</li>
+<li>pedram (2006). <a href="https://www.openrce.org/blog/view/535/Branch_Tracing_with_Intel_MSR_Registers">Branch Tracing with Intel MSR Registers</a> (<a href="https://web.archive.org/web/20071230112601/https://www.openrce.org/blog/view/535/Branch_Tracing_with_Intel_MSR_Registers">archive</a>)</li>
+<li>everdox (2013). <a href="https://www.codeproject.com/Articles/517466/Last-branch-records-and-branch-tracing">Last branch records and branch tracing</a> (<a href="https://web.archive.org/web/20130617212908/http://www.codeproject.com/Articles/517466/Last-branch-records-and-branch-tracing">archive</a>)</li>
+<li>Andrea Allievi, Alex Ionescu, Mark E. Russinovich, David A. Solomon (2021). Windows Internals, Part 2, 7th Edition</li>
+<li>Windows SDK (<code>kxamd64.inc</code>) version 10.0.22000.0, referenced in September 2024. <a href="https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/">https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/</a></li>
+<li>ReactOS, referenced in September 2024. <a href="https://github.com/reactos/reactos">https://github.com/reactos/reactos</a></li>
+<li>Sergey Podobry, Svitlana Storchak (Vergilius Project, 2024)</li>
+<li>Ken Johnson (2006). <a href="https://web.archive.org/web/20240927092935/http://www.nynaeve.net/?p=99">Programming against the x64 exception handling support</a> (archived link)</li>
+<li>auscitte (2021). <a href="https://auscitte.github.io/posts/Exception-Directory-pefile">Boots for Walking Backwards: Teaching pefile How to Understand SEH-Related Data in 64-bit PE Files</a> (<a href="https://web.archive.org/web/20220125040403/https://auscitte.github.io/posts/Exception-Directory-pefile">archive</a>)</li>
+<li>GitHub 1027565 (2024). <a href="https://github.com/1027565/InstrumentationCallbacks">https://github.com/1027565/InstrumentationCallbacks</a></li>
+<li>GitHub Deputation (2021). <a href="https://github.com/Deputation/instrumentation_callbacks">https://github.com/Deputation/instrumentation_callbacks</a></li>
+<li>CodeMachine (Release date unknown, consulted on September 2024). <a href="https://codemachine.com/articles/x64_deep_dive.html">x64 Deep Dive</a> (<a href="https://web.archive.org/web/20210213055724/https://codemachine.com/articles/x64_deep_dive.html">archive</a>)</li>
+<li>Microsoft Developer Network (MSDN). <a href="https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions?view=msvc-170">Overview of x64 ABI conventions</a> (<a href="https://web.archive.org/web/20241010175415/https://learn.microsoft.com/en-us/cpp/build/x64-software-conventions?view=msvc-170">archive</a>)</li>
+<li>Microsoft Developer Network (MSDN). <a href="https://learn.microsoft.com/en-us/cpp/build/stack-usage?view=msvc-170">x64 stack usage</a> (<a href="https://web.archive.org/web/20240930155635/https://learn.microsoft.com/en-us/cpp/build/stack-usage?view=msvc-170">archive</a>)</li>
+</ul>
+<div class="footnotes" role="doc-endnotes">
+<hr>
+<ol>
+<li id="fn:1">
+<p><a href="https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_KTRAP_FRAME">https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_KTRAP_FRAME</a>&#160;<a href="#fnref:1" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:2">
+<p>Control privilege level, also known as ring level: <a href="https://en.wikipedia.org/wiki/Protection_ring">https://en.wikipedia.org/wiki/Protection_ring</a>&#160;<a href="#fnref:2" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:3">
+<p><code>KiBreakpointTrap</code>, <code>KiOverflowTrap</code>, <code>KiRaiseSecurityCheckFailure</code>, <code>KiRaiseAssertion</code>, <code>KiDebugServiceTrap</code>, <code>KiSystemCall64</code>, <code>KiSystemCall32</code>&#160;<a href="#fnref:3" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:4">
+<p><a href="https://msrc.microsoft.com/blog/2018/03/kva-shadow-mitigating-meltdown-on-windows/">https://msrc.microsoft.com/blog/2018/03/kva-shadow-mitigating-meltdown-on-windows/</a> (<a href="https://web.archive.org/web/20240621070025/https://msrc.microsoft.com/blog/2018/03/kva-shadow-mitigating-meltdown-on-windows/%5D">archive</a>)&#160;<a href="#fnref:4" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:5">
+<p>Multimedia Extensions Control and Status Register - used for controlling floating-point exceptions on SIMD registers.&#160;<a href="#fnref:5" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:6">
+<p>Supervisor mode access prevention is a mitigation that causes an exception to be raised when code running in supervisor mode (CPL0) attempts to access pages marked for user.&#160;<a href="#fnref:6" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:7">
+<p><a href="https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_KEXCEPTION_FRAME">https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_KEXCEPTION_FRAME</a>&#160;<a href="#fnref:7" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:8">
+<p><a href="https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_EXCEPTION_RECORD">https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_EXCEPTION_RECORD</a>&#160;<a href="#fnref:8" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:9">
+<p><a href="https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_CONTEXT">https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_CONTEXT</a>&#160;<a href="#fnref:9" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:10">
+<p>Pico processes are a fairly interesting feature of Windows, initially used to provide support for the first iteration of Windows Subsystem for Linux (WSL). Nowadays I&rsquo;m not aware if they&rsquo;re still in use or not, as WSL2 runs in a full virtual machine instead as opposed to the emulation of WSL1. For more reading on the subject, please refer to this paper by the legendary Alex Ionescu: <a href="https://github.com/ionescu007/lxss/blob/master/The%20Linux%20kernel%20hidden%20inside%20windows%2010.pdf">https://github.com/ionescu007/lxss/blob/master/The%20Linux%20kernel%20hidden%20inside%20windows%2010.pdf</a> (<a href="https://web.archive.org/web/20221205110950/https://raw.githubusercontent.com/ionescu007/lxss/master/The%20Linux%20kernel%20hidden%20inside%20windows%2010.pdf">archive</a>)&#160;<a href="#fnref:10" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:11">
+<p>I imagine this is to prevent potential leakage of kernel pointers into the user stack.&#160;<a href="#fnref:11" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:12">
+<p><a href="https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_MACHINE_FRAME">https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_MACHINE_FRAME</a>&#160;<a href="#fnref:12" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:13">
+<p>AMD64 Architecture Programmer’s Manual Volumes 1–5 (June 2023)&#160;<a href="#fnref:13" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:14">
+<p>In theory, there are two variations of the structure &ndash; one with an error code and the other without &ndash; but Windows only utilizes the former. The 8 byte discrepancy between both types is explained later.&#160;<a href="#fnref:14" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:15">
+<p>pp. 377 - Task management (AMD64 Architecture Programmer&rsquo;s Manual Volume 2: System Programming)&#160;<a href="#fnref:15" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+<li id="fn:16">
+<p><a href="https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_KTSS64">https://www.vergiliusproject.com/kernels/x64/windows-11/insider-preview-jun-2021/_KTSS64</a>&#160;<a href="#fnref:16" class="footnote-backref" role="doc-backlink">&#x21a9;&#xfe0e;</a></p>
+</li>
+</ol>
+</div>
+
+    </div>
+    <footer class="content__footer"></footer>
+
+            </section>
+
+            <section class="page__aside">
+                <div class="aside__about">
+
+<ul class="aside__social-links">
+    
+</ul>
+</div>
+                <hr>
+                <div class="aside__content">
+    
+    
+        <p>
+            
+            2025-02-24
+        </p>
+    
+
+    
+
+                </div>
+            </section>
+
+            <footer class="page__footer"><p>
+    
+    
+    
+    
+    
+    
+      
+    
+    
+    
+      
+      
+          
+            
+            
+                <br/><span class="active">$ echo $LANG<br/><b></b></span><br/>
+
+            
+          
+      
+    
+</p>
+<br /><br />
+<p class="copyright"></p>
+<p class="advertisement">Powered by <a href="https://gohugo.io/">hugo</a> and <a href="https://github.com/joeroe/risotto">risotto</a>.</p>
+</footer>
+
+        </div>
+    </body>
+
+</html>
