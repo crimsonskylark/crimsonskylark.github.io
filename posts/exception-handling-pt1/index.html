@@ -445,7 +445,7 @@
 <ul>
 <li><code>ExceptionContinueExecution</code>: The exception is considered handled, and no further handlers will be invoked. Execution resumes at the faulting instruction pointer. This option is only valid for some exception types such as in our case of <code>STATUS_SINGLE_STEP</code>/INT1.</li>
 <li><code>ExceptionContinueSearch</code>: The exception handler was either unable to handle the reported exception or declined it altogether. The unwinding process will continue for the next stack frame (i.e., the caller of the faulting function).</li>
-<li><code>ExceptionNestedException</code>: Another exception occurred during the execution of the handler. This is disposition is reported by the exception handler for <code>RtlpExecuteHandlerForException</code>: <code>RtlpExceptionHandler</code>.</li>
+<li><code>ExceptionNestedException</code>: Another exception occurred during the execution of the handler. This disposition is reported by the exception handler for <code>RtlpExecuteHandlerForException</code>: <code>RtlpExceptionHandler</code>.</li>
 </ul>
 <p>After being called, the language handler iterates through the scope table, looking for the smallest scope that encompasses the faulting instruction. If this is not its first invocation with the given dispatcher context, the search begins at <code>_DISPATCHER_CONTEXT.ScopeIndex</code>; otherwise, it starts from the beginning. When the target scope is identified, there are two primary scenarios to handle:</p>
 <ol>
